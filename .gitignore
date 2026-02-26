@@ -1,0 +1,26 @@
+# Environments
+venv/
+env/
+.env
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Datasets and Processing
+data/raw/
+data/processed/
+*.flac
+*.wav
+*.npy
+*.pt
+
+# Model Checkpoints
+*.pth
+*.tar
+checkpoints/
+logs/
+
+# IDE Configuration
+.vscode/
