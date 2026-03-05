@@ -1,4 +1,15 @@
+import sys
 import os
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+sys.path.append(ROOT_DIR)
+
+RESULTS_DIR = os.path.join(ROOT_DIR, "results")
+MODELS_DIR = os.path.join(ROOT_DIR, "saved_models")
+os.makedirs(RESULTS_DIR, exist_ok=True)
+os.makedirs(MODELS_DIR, exist_ok=True)
+
 import shutil
 import glob
 import torch
@@ -21,7 +32,7 @@ RAW_CUSTOM_DIR = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset\Custom_Raw_Audio"
 RAW_EVAL_DIR = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset\2019\LA\ASVspoof2019_LA_eval\flac"
 SHARED_PREPROCESSED_DIR = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset\evaluation_preprocessed"
 PROTOCOL_EVAL = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset\2019\LA\ASVspoof2019_LA_cm_protocols\ASVspoof2019.LA.cm.eval.trl.txt"
-MODEL_WEIGHTS = "aasist_baseline_best.pth"
+MODEL_WEIGHTS = os.path.join(MODELS_DIR, "aasist_baseline_best.pth")
 
 def apply_vad_and_norm(waveform):
     original_waveform = waveform.clone()
@@ -66,7 +77,6 @@ def preprocess_custom(target_length=64600):
         seq_len = waveform.shape[-1]
         chunks = []
         
-        # Sliding Window Logic for Custom Files
         if seq_len > (2 * target_length):
             step = target_length 
             for start in range(0, seq_len - target_length + 1, step):
@@ -107,7 +117,6 @@ def preprocess_evaluation(target_length=64600):
         
         seq_len = waveform.shape[-1]
         
-        # Strict Center Crop / Reflect Logic for Evaluation Dataset
         if seq_len > target_length:
             start = (seq_len - target_length) // 2
             waveform = waveform[:, start:start + target_length]
@@ -225,7 +234,6 @@ def main():
                 outputs = model(waveforms)
                 probs = torch.softmax(outputs, dim=1)[:, 1]
                 
-                # Tracking Accuracy
                 _, predicted_classes = torch.max(outputs.data, 1)
                 total_samples += labels.size(0)
                 correct_predictions += (predicted_classes == labels).sum().item()
@@ -236,7 +244,6 @@ def main():
         all_labels = np.array(all_labels)
         all_probs = np.array(all_probs)
         
-        # Calculate Metrics
         accuracy = (correct_predictions / total_samples) * 100
         fpr, tpr, thresholds = roc_curve(all_labels, all_probs, pos_label=1)
         fnr = 1 - tpr
@@ -263,7 +270,8 @@ def main():
         plt.title('Receiver Operating Characteristic (ROC) Curve')
         plt.legend(loc="lower right")
         plt.grid(True, linestyle=':', alpha=0.6)
-        plt.savefig("eval_roc_curve.png", dpi=300)
+        roc_path = os.path.join(RESULTS_DIR, "eval_roc_curve.png")
+        plt.savefig(roc_path, dpi=300)
         plt.close()
         
         fig, ax = plt.subplots(figsize=(8, 6))
@@ -271,9 +279,10 @@ def main():
         display.plot(ax=ax)
         plt.title('Detection Error Tradeoff (DET) Curve')
         plt.grid(True, linestyle=':', alpha=0.6)
-        plt.savefig("eval_det_curve.png", dpi=300)
+        det_path = os.path.join(RESULTS_DIR, "eval_det_curve.png")
+        plt.savefig(det_path, dpi=300)
         plt.close()
-        print("Graphs saved successfully.")
+        print(f"Graphs successfully saved to {RESULTS_DIR}")
 
     else:
         print("Invalid selection. Please run the script again and type 1 or 2.")

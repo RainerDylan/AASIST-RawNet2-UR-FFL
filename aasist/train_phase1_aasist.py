@@ -1,9 +1,20 @@
+import sys
+import os
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+sys.path.append(ROOT_DIR)
+
+RESULTS_DIR = os.path.join(ROOT_DIR, "results")
+MODELS_DIR = os.path.join(ROOT_DIR, "saved_models")
+os.makedirs(RESULTS_DIR, exist_ok=True)
+os.makedirs(MODELS_DIR, exist_ok=True)
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
-import os
 import numpy as np
 import time
 import datetime
@@ -75,7 +86,6 @@ def main():
         weight_decay=0.01
     )
     
-    # Strictly 80 Epochs for Phase 1 Preparation
     total_epochs = 80
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=1e-6)
     
@@ -91,7 +101,6 @@ def main():
     for epoch in range(total_epochs):
         epoch_start_time = time.time()
         
-        # --- TRAINING PHASE ---
         model.train()
         train_loss = 0.0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{total_epochs} [Train]")
@@ -111,7 +120,6 @@ def main():
             
         avg_train_loss = train_loss / len(train_loader)
         
-        # --- VALIDATION PHASE ---
         model.eval()
         val_loss = 0.0
         correct = 0
@@ -150,7 +158,6 @@ def main():
         history_val_acc.append(val_accuracy)
         history_val_eer.append(val_eer)
         
-        # Calculate ETA
         epoch_duration = time.time() - epoch_start_time
         total_training_time += epoch_duration
         avg_epoch_time = total_training_time / (epoch + 1)
@@ -164,10 +171,10 @@ def main():
         
         if val_eer < best_eer:
             best_eer = val_eer
-            torch.save(model.state_dict(), "aasist_phase1_best.pth")
-            print("  -> EER Improved! New best model saved.")
+            save_path = os.path.join(MODELS_DIR, "aasist_phase1_best.pth")
+            torch.save(model.state_dict(), save_path)
+            print(f"  -> EER Improved! Saved to {save_path}")
 
-    # --- GRAPH GENERATION ---
     print("Phase 1 Training complete. Generating learning curve graphs...")
     epochs_range = range(1, total_epochs + 1)
     
@@ -199,8 +206,9 @@ def main():
     plt.grid(True, linestyle=':', alpha=0.6)
     
     plt.tight_layout()
-    plt.savefig("aasist_phase1_metrics.png", dpi=300)
-    print("Graph saved as 'aasist_phase1_metrics.png'.")
+    graph_path = os.path.join(RESULTS_DIR, "aasist_phase1_metrics.png")
+    plt.savefig(graph_path, dpi=300)
+    print(f"Graph saved to {graph_path}")
 
 if __name__ == "__main__":
     main()

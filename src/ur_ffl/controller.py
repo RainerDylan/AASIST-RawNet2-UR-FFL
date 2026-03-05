@@ -1,19 +1,27 @@
 class PDController:
-    def __init__(self, target_uncertainty=0.4, kp=0.1, kd=0.05, max_severity=1.0):
-        self.target_uncertainty = target_uncertainty
-        self.kp = kp
-        self.kd = kd
-        self.max_severity = max_severity
+    def __init__(self):
+        # Section 3.5.3.1 & 3.5.3.2 parameters
+        self.target = 0.15
+        self.kp = 0.3
+        self.kd = 0.1
+        self.min_alpha = 0.3
+        self.max_alpha = 0.9
+        
         self.prev_error = 0.0
-        self.severity = 0.0
+        self.alpha = 0.5 
 
-    def compute_severity(self, current_uncertainty):
-        error = self.target_uncertainty - current_uncertainty
+    def compute_severity(self, mean_zu_sq):
+        # Eq 10: e(t) = 0.15 - mean(Zu^2)
+        error = self.target - mean_zu_sq
+        
+        # Eq 11: PD Update Rule
         p_term = self.kp * error
         d_term = self.kd * (error - self.prev_error)
         
-        self.severity += (p_term + d_term)
-        self.severity = max(0.0, min(self.severity, self.max_severity))
+        self.alpha += (p_term + d_term)
+        
+        # Clamping as defined in Section 3.5.3.3
+        self.alpha = max(self.min_alpha, min(self.alpha, self.max_alpha))
         self.prev_error = error
         
-        return self.severity
+        return self.alpha

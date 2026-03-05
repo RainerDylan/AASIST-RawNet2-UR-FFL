@@ -1,11 +1,11 @@
 import torch
 
 class UncertaintySensor:
-    def __init__(self, mc_passes=5):
+    def __init__(self, mc_passes=50):
+        # Section 3.5.1 mandates T=50 passes
         self.mc_passes = mc_passes
 
     def measure(self, model, waveforms):
-        # Lock BatchNorm to prevent memory scrambling, but enable Dropout
         model.eval()
         for m in model.modules():
             if m.__class__.__name__.startswith('Dropout'):
@@ -15,14 +15,25 @@ class UncertaintySensor:
             outputs = []
             for _ in range(self.mc_passes):
                 logits = model(waveforms)
-                probs = torch.softmax(logits, dim=1)
+                probs = torch.softmax(logits, dim=1)[:, 1] 
                 outputs.append(probs.unsqueeze(0))
                 
             outputs = torch.cat(outputs, dim=0) 
-            mean_probs = outputs.mean(dim=0)    
             
-            # Shannon Entropy calculation
-            entropy = -torch.sum(mean_probs * torch.log(mean_probs + 1e-8), dim=1)
-            batch_uncertainty = entropy.mean().item()
+            # Eq 6: Predictive Mean
+            mu = outputs.mean(dim=0)
+            # Eq 7: Predictive Variance
+            sigma_sq = outputs.var(dim=0, unbiased=False)
             
-        return batch_uncertainty
+            # Eq 8: Epistemic Uncertainty
+            aleatoric = mu * (1.0 - mu) + 1e-8
+            u_epistemic = sigma_sq / aleatoric
+            
+            # Eq 9: Z-Score Standardization
+            batch_mu = u_epistemic.mean()
+            batch_std = u_epistemic.std() + 1e-8
+            z_u = (u_epistemic - batch_mu) / batch_std
+            
+            mean_zu_sq = (z_u ** 2).mean().item()
+            
+        return z_u, mean_zu_sq

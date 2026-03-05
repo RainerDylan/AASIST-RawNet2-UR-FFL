@@ -1,9 +1,20 @@
+import sys
+import os
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+sys.path.append(ROOT_DIR)
+
+RESULTS_DIR = os.path.join(ROOT_DIR, "results")
+MODELS_DIR = os.path.join(ROOT_DIR, "saved_models")
+os.makedirs(RESULTS_DIR, exist_ok=True)
+os.makedirs(MODELS_DIR, exist_ok=True)
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
-import os
 import numpy as np
 import time
 import datetime
@@ -24,7 +35,7 @@ PREPROCESSED_TRAIN_DIR = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset\ASVspoof2019
 PREPROCESSED_DEV_DIR = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset\ASVspoof2019_LA_dev_preprocessed"
 PROTOCOL_TRAIN = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset\2019\LA\ASVspoof2019_LA_cm_protocols\ASVspoof2019.LA.cm.train.trn.txt"
 PROTOCOL_DEV = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset\2019\LA\ASVspoof2019_LA_cm_protocols\ASVspoof2019.LA.cm.dev.trl.txt"
-PHASE1_WEIGHTS = "aasist_phase1_best.pth"
+PHASE1_WEIGHTS = os.path.join(MODELS_DIR, "aasist_phase1_best.pth")
 
 def create_weighted_sampler(dataset):
     labels = dataset.labels
@@ -53,21 +64,36 @@ def main():
     print(f"Loading Phase 1 Baseline Weights from {PHASE1_WEIGHTS}...")
     model.load_state_dict(torch.load(PHASE1_WEIGHTS, map_location=device))
     
+    # Section 3.7.2: Semantic Freeze Transition
+    print("Applying Semantic Freeze to AASIST Feature Extractors...")
+    frozen_params = 0
+    unfrozen_params = 0
+    for name, param in model.named_parameters():
+        if 'encoder' in name or 'sinc' in name or 'GAT_layer1' in name or 'gat1' in name or 'node_embedding' in name:
+            param.requires_grad = False
+            frozen_params += param.numel()
+        else:
+            param.requires_grad = True
+            unfrozen_params += param.numel()
+    print(f"Frozen Parameters: {frozen_params} | Unfrozen Parameters: {unfrozen_params}")
+    
     print("Loading datasets to memory structure...")
     train_dataset = ASVspoofDataset(PREPROCESSED_TRAIN_DIR, PROTOCOL_TRAIN)
     val_dataset = ASVspoofDataset(PREPROCESSED_DEV_DIR, PROTOCOL_DEV)
     sampler = create_weighted_sampler(train_dataset)
     
-    train_loader = DataLoader(train_dataset, batch_size=21, sampler=sampler, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=21, shuffle=False, num_workers=4)
+    # Batch size 32 is strictly specified in Section 3.5
+    train_loader = DataLoader(train_dataset, batch_size=32, sampler=sampler, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
     
-    sensor = UncertaintySensor(mc_passes=5)
-    controller = PDController(target_uncertainty=0.4, kp=0.1, kd=0.05)
+    sensor = UncertaintySensor(mc_passes=50)
+    controller = PDController()
     selector = DegradationSelector()
     actuator = DegradationActuator(device)
     
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=1.2632482657736836e-06, weight_decay=0.01)
+    # Section 3.7.3.3 requires learning rate reduced to 1x10^-4
+    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4, weight_decay=0.01)
     
     total_epochs = 50
     best_eer = float('inf')
@@ -91,22 +117,32 @@ def main():
             waveforms = waveforms.squeeze(1).to(device)
             labels = labels.to(device)
             
-            uncertainty = sensor.measure(model, waveforms)
-            severity = controller.compute_severity(uncertainty)
-            epoch_severities.append(severity)
+            # 3.7.3.1 Uncertainty Measurement
+            z_u, mean_zu_sq = sensor.measure(model, waveforms)
             
-            selections = selector.select(waveforms.size(0))
-            aug_waveforms = actuator.apply(waveforms, selections, severity)
+            # 3.7.3.2 Adaptive Degradation Selection
+            alpha = controller.compute_severity(mean_zu_sq)
+            epoch_severities.append(alpha)
             
+            selections = selector.select(z_u)
+            aug_waveforms = actuator.apply(waveforms, labels, selections, alpha)
+            
+            # 3.7.3.3 The Double-Forward Training Step
             model.train()
             optimizer.zero_grad()
-            outputs = model(aug_waveforms)
-            loss = criterion(outputs, labels)
-            loss.backward()
+            
+            outputs_clean = model(waveforms)
+            loss_clean = criterion(outputs_clean, labels)
+            
+            outputs_deg = model(aug_waveforms)
+            loss_deg = criterion(outputs_deg, labels)
+            
+            loss_total = 0.5 * loss_clean + 0.5 * loss_deg
+            loss_total.backward()
             optimizer.step()
             
-            train_loss += loss.item()
-            pbar.set_postfix({"loss": f"{loss.item():.4f}", "severity": f"{severity:.2f}"})
+            train_loss += loss_total.item()
+            pbar.set_postfix({"loss": f"{loss_total.item():.4f}", "alpha": f"{alpha:.2f}"})
             
         avg_train_loss = train_loss / len(train_loader)
         avg_severity = sum(epoch_severities) / len(epoch_severities)
@@ -152,13 +188,14 @@ def main():
         eta_seconds = int(avg_epoch_time * (total_epochs - (epoch + 1)))
         eta_string = str(datetime.timedelta(seconds=eta_seconds))
         
-        print(f"End of Epoch {epoch+1} | Avg Severity: {avg_severity:.2f} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val Acc: {val_accuracy:.2f}% | Val EER: {val_eer:.4f}%")
+        print(f"End of Epoch {epoch+1} | Avg Alpha: {avg_severity:.2f} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val Acc: {val_accuracy:.2f}% | Val EER: {val_eer:.4f}%")
         print(f"  -> Epoch Time: {epoch_duration:.1f}s | Estimated Time Left: {eta_string}")
         
         if val_eer < best_eer:
             best_eer = val_eer
-            torch.save(model.state_dict(), "aasist_phase2_urffl_best.pth")
-            print("  -> UR-FFL EER Improved! New Phase 2 model saved.")
+            save_path = os.path.join(MODELS_DIR, "aasist_phase2_urffl_best.pth")
+            torch.save(model.state_dict(), save_path)
+            print(f"  -> UR-FFL EER Improved! Saved to {save_path}")
 
     print("Phase 2 Training complete. Generating learning curve graphs...")
     epochs_range = range(1, total_epochs + 1)
@@ -188,16 +225,17 @@ def main():
     plt.grid(True, linestyle=':', alpha=0.6)
 
     plt.subplot(1, 4, 4)
-    plt.plot(epochs_range, history_severity, label='Avg Augmentation Severity', color='orange')
+    plt.plot(epochs_range, history_severity, label='Avg Augmentation Severity (alpha)', color='orange')
     plt.title('UR-FFL PD Controller Actions')
     plt.xlabel('Epochs')
-    plt.ylabel('Severity Level (0 to 1)')
+    plt.ylabel('Alpha Level (0.3 to 0.9)')
     plt.legend()
     plt.grid(True, linestyle=':', alpha=0.6)
     
     plt.tight_layout()
-    plt.savefig("aasist_phase2_metrics.png", dpi=300)
-    print("Graph saved as 'aasist_phase2_metrics.png'.")
+    graph_path = os.path.join(RESULTS_DIR, "aasist_phase2_metrics.png")
+    plt.savefig(graph_path, dpi=300)
+    print(f"Graph saved to {graph_path}")
 
 if __name__ == "__main__":
     main()
