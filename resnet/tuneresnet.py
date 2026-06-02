@@ -9,12 +9,18 @@ import torch.nn.functional as F
 import torchaudio.transforms as T
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
-import optuna
 from sklearn.metrics import roc_curve
+from scipy.interpolate import interp1d
+from scipy.optimize import brentq
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import optuna.visualization.matplotlib as vis
+
+# Ray Tune & BOHB
+import ray
+from ray import train, tune
+from ray.tune.search.bohb import TuneBOHB
+from ray.tune.schedulers import HyperBandForBOHB
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
@@ -26,28 +32,34 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 from src.data.dataset import ASVspoofDataset
 from src.models.resnet_simam import resnet18_simam
 
+# Train Set
 PREPROCESSED_TRAIN_DIR = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset\ASVspoof2019_LA_train_preprocessed"
 PROTOCOL_TRAIN = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset\2019\LA\ASVspoof2019_LA_cm_protocols\ASVspoof2019.LA.cm.train.trn.txt"
 
-def get_balanced_subsets(dataset, train_size=1000, val_size=400):
+# Dev Set (Crucial for preventing data leakage)
+PREPROCESSED_DEV_DIR = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset\ASVspoof2019_LA_dev_preprocessed"
+PROTOCOL_DEV = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset\2019\LA\ASVspoof2019_LA_cm_protocols\ASVspoof2019.LA.cm.dev.trl.txt"
+
+def get_balanced_subset(dataset, size=1000):
     bonafide_idx = [i for i, label in enumerate(dataset.labels) if label == 1]
     spoof_idx = [i for i, label in enumerate(dataset.labels) if label == 0]
-    
     random.shuffle(bonafide_idx)
     random.shuffle(spoof_idx)
-    
-    half_train = train_size // 2
-    train_indices = bonafide_idx[:half_train] + spoof_idx[:half_train]
-    
-    half_val = val_size // 2
-    val_indices = bonafide_idx[half_train:half_train+half_val] + spoof_idx[half_train:half_train+half_val]
-    
-    return Subset(dataset, train_indices), Subset(dataset, val_indices)
+    half = size // 2
+    indices = bonafide_idx[:half] + spoof_idx[:half]
+    return Subset(dataset, indices)
 
 def compute_eer(y_true, y_scores):
-    fpr, tpr, _ = roc_curve(y_true, y_scores, pos_label=1)
-    fnr = 1.0 - tpr
-    return float(fpr[np.nanargmin(np.abs(fnr - fpr))]) * 100.0
+    try:
+        fpr, tpr, _ = roc_curve(y_true, y_scores, pos_label=1)
+        fnr = 1. - tpr
+        eer = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
+    except Exception:
+        fpr, tpr, _ = roc_curve(y_true, y_scores, pos_label=1)
+        fnr = 1. - tpr
+        idx = np.nanargmin(np.abs(fnr - fpr))
+        eer = float((fpr[idx] + fnr[idx]) / 2.)
+    return float(eer * 100.)
 
 class FocalLoss(nn.Module):
     def __init__(self, gamma=2.0, label_smoothing=0.05):
@@ -67,43 +79,33 @@ class FocalLoss(nn.Module):
         ce = -(smooth * log_p).sum(dim=1)
         return (weight * ce).mean()
 
-def objective(trial):
+def train_resnet(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # ── Feature Extraction Search Space ───────────────────────────────────
-    n_fft       = trial.suggest_categorical("n_fft", [256, 512, 1024])
-    hop_length  = trial.suggest_categorical("hop_length", [64, 128, 160, 256])
-    n_mels      = trial.suggest_categorical("n_mels", [64, 80, 128])
-
-    # ── Regularization & Optimization Search Space ──────────────────────
-    dropout     = trial.suggest_float("dropout", 0.1, 0.5)
-    lr          = trial.suggest_float("lr", 1e-5, 5e-3, log=True)
-    batch_size  = trial.suggest_categorical("batch_size", [16, 32, 64])
-    weight_decay= trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
-    
-    print(f"\n[Trial {trial.number}] Mels: {n_mels} | n_fft: {n_fft} | Hop: {hop_length} | LR: {lr:.2e} | Drop: {dropout:.2f} | Batch: {batch_size}")
-    
-    model = resnet18_simam(num_classes=2, dropout_rate=dropout).to(device)
-    
-    dataset = ASVspoofDataset(PREPROCESSED_TRAIN_DIR, PROTOCOL_TRAIN)
-    train_subset, val_subset = get_balanced_subsets(dataset, train_size=1000, val_size=400)
-    
-    train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=2)
-    
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    criterion = FocalLoss(gamma=2.0, label_smoothing=0.05)
-    
-    # Apply dynamic front-end settings
-    mel_transform = T.MelSpectrogram(sample_rate=16000, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels).to(device)
+    model = resnet18_simam(num_classes=2, dropout_rate=config["dropout"]).to(device)
+    mel_transform = T.MelSpectrogram(
+        sample_rate=16000, 
+        n_fft=config["n_fft"], 
+        hop_length=config["hop_length"], 
+        n_mels=config["n_mels"]
+    ).to(device)
     amp_to_db = T.AmplitudeToDB(stype="power", top_db=80).to(device)
+    
+    train_dataset = ASVspoofDataset(PREPROCESSED_TRAIN_DIR, PROTOCOL_TRAIN)
+    val_dataset = ASVspoofDataset(PREPROCESSED_DEV_DIR, PROTOCOL_DEV)
+    
+    train_subset = get_balanced_subset(train_dataset, size=1000)
+    val_subset = get_balanced_subset(val_dataset, size=400)
+    
+    train_loader = DataLoader(train_subset, batch_size=config["batch_size"], shuffle=True, num_workers=2)
+    val_loader = DataLoader(val_subset, batch_size=config["batch_size"], shuffle=False, num_workers=2)
+    
+    optimizer = optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
+    criterion = FocalLoss(gamma=2.0, label_smoothing=0.05)
     scaler = torch.amp.GradScaler("cuda")
     
-    epochs = 15
-    for epoch in range(epochs):
+    while True:
         model.train()
-        train_loss = 0.0
-        
         for waveforms, labels in train_loader:
             waveforms = waveforms.squeeze(1).to(device)
             labels = labels.to(device)
@@ -112,20 +114,18 @@ def objective(trial):
             with torch.no_grad():
                 mel = mel_transform(waveforms)
                 mel_db = amp_to_db(mel).unsqueeze(1)
-            
+                
             with torch.amp.autocast("cuda"):
                 outputs = model(mel_db)
                 loss = criterion(outputs, labels)
-            
+                
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
-            train_loss += loss.item()
             
-        avg_train_loss = train_loss / len(train_loader)
-        
         model.eval()
-        val_loss = 0.0
         val_labels = []
         val_probs = []
         
@@ -133,81 +133,102 @@ def objective(trial):
             for wv, lv in val_loader:
                 wv = wv.squeeze(1).to(device)
                 lv = lv.to(device)
+                
                 mel = mel_transform(wv)
                 mel_db = amp_to_db(mel).unsqueeze(1)
                 
                 with torch.amp.autocast("cuda"):
                     outputs = model(mel_db)
-                    val_loss += criterion(outputs, lv).item()
-                
+                    
                 val_labels.extend(lv.cpu().numpy())
                 val_probs.extend(torch.softmax(outputs, dim=1)[:, 1].cpu().numpy())
                 
-        avg_val_loss = val_loss / len(val_loader)
         val_eer = compute_eer(val_labels, val_probs)
         
-        print(f"  Epoch {epoch+1:2d}/{epochs} | LR: {optimizer.param_groups[0]['lr']:.2e} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val EER: {val_eer:.2f}%")
+        # Report metric to BOHB Scheduler
+        train.report({"eer": val_eer})
+
+def plot_bohb_graphs(results_df, prefix="resnet"):
+    plt.figure(figsize=(10, 6))
+    valid_df = results_df.dropna(subset=['eer'])
+    valid_df = valid_df.sort_values(by='training_iteration')
+    
+    best_eer_so_far = []
+    current_best = float('inf')
+    for eer in valid_df['eer']:
+        if eer < current_best:
+            current_best = eer
+        best_eer_so_far.append(current_best)
         
-        trial.report(val_eer, epoch)
-        if trial.should_prune():
-            print(f"  [Pruned] Trial {trial.number} underperformed and was halted early by Hyperband.")
-            raise optuna.exceptions.TrialPruned()
-            
-    return val_eer
+    plt.plot(range(len(valid_df)), valid_df['eer'], 'o', alpha=0.3, label='Objective Value (EER)')
+    plt.plot(range(len(valid_df)), best_eer_so_far, color='red', lw=2, label='Best Value')
+    plt.title(f"{prefix.upper()} BOHB Optimization History")
+    plt.xlabel("Trial Number")
+    plt.ylabel("Validation EER (%)")
+    plt.legend()
+    plt.grid(True, ls=":", alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, f"{prefix}_bohb_opt_history.png"), dpi=300)
+    plt.close()
 
 if __name__ == "__main__":
-    print("Initiating TPE + Hyperband Tuning for ResNet-SimAM (Frontend + Reg)...")
-    pruner = optuna.pruners.HyperbandPruner(min_resource=3, max_resource=15, reduction_factor=3)
-    sampler = optuna.samplers.TPESampler(seed=42)
+    print("Initiating BOHB (Bayesian Optimization + HyperBand) Tuning for ResNet-SimAM...")
     
-    study = optuna.create_study(
-        study_name="resnet_hyperband_optimization",
-        storage="sqlite:///resnet_tuning.db",
-        load_if_exists=True,
-        direction="minimize",
-        pruner=pruner,
-        sampler=sampler
+    # Ray Tune Search Space
+    search_space = {
+        "n_fft": tune.choice([512, 1024, 2048]),
+        "hop_length": tune.choice([128, 160, 256, 512]),
+        "n_mels": tune.choice([64, 80, 128]),
+        "dropout": tune.uniform(0.1, 0.5),
+        "lr": tune.loguniform(1e-6, 5e-3),
+        "batch_size": tune.choice([16, 32, 64]),
+        "weight_decay": tune.loguniform(1e-6, 1e-3)
+    }
+
+    # BOHB Configuration
+    algo = TuneBOHB(metric="eer", mode="min")
+    scheduler = HyperBandForBOHB(
+        time_attr="training_iteration",
+        max_t=15, # Max epochs per trial
+        reduction_factor=3
     )
+
+    tuner = tune.Tuner(
+        train_resnet,
+        tune_config=tune.TuneConfig(
+            metric="eer",
+            mode="min",
+            search_alg=algo,
+            scheduler=scheduler,
+            num_samples=50, # Number of trials
+        ),
+        param_space=search_space,
+    )
+
+    results = tuner.fit()
     
-    study.optimize(objective, n_trials=30, timeout=14400)
+    # Extract Best Parameters
+    best_result = results.get_best_result("eer", "min")
+    best_config = best_result.config
+    best_eer = best_result.metrics["eer"]
     
     print("\n=================================================")
-    print("Optimization Completed!")
-    best_trial = study.best_trial
-    print(f"Best Validation EER: {best_trial.value:.4f}%")
+    print("BOHB Optimization Completed!")
+    print(f"Best Validation EER: {best_eer:.4f}%")
     
-    txt_path = os.path.join(RESULTS_DIR, "resnet_best_params.txt")
+    txt_path = os.path.join(RESULTS_DIR, "resnet_best_params_bohb.txt")
     with open(txt_path, "w") as f:
         f.write("=========================================\n")
-        f.write("RESNET-SIMAM OPTIMAL HYPERPARAMETERS\n")
+        f.write("RESNET-SIMAM OPTIMAL HYPERPARAMETERS (BOHB)\n")
         f.write("=========================================\n")
-        f.write(f"Best Validation EER: {best_trial.value:.4f}%\n\n")
-        for key, value in best_trial.params.items():
+        f.write(f"Best Validation EER: {best_eer:.4f}%\n\n")
+        for key, value in best_config.items():
             print(f"  {key}: {value}")
             f.write(f"{key}: {value}\n")
     print(f"\nSaved optimal parameters to {txt_path}")
 
-    print("\nGenerating Diagnostic Optuna Graphs...")
-
-    fig_hist = vis.plot_optimization_history(study)
-    plt.title("ResNet-SimAM Tuning Optimization History")
-    plt.tight_layout()
-    plt.savefig(os.path.join(RESULTS_DIR, "resnet_opt_history.png"), dpi=300)
-    plt.close()
-
-    try:
-        fig_imp = vis.plot_param_importances(study)
-        plt.title("ResNet-SimAM Hyperparameter Importance")
-        plt.tight_layout()
-        plt.savefig(os.path.join(RESULTS_DIR, "resnet_param_importance.png"), dpi=300)
-        plt.close()
-    except Exception as e:
-        print(f"Skipping Parameter Importance graph. Not enough completed trials yet.")
-
-    fig_slice = vis.plot_slice(study)
-    plt.title("ResNet-SimAM Parameter Distribution Slice Plot")
-    plt.tight_layout()
-    plt.savefig(os.path.join(RESULTS_DIR, "resnet_slice_plot.png"), dpi=300)
-    plt.close()
-
+    # Generate Graphs
+    print("\nGenerating Diagnostic BOHB Graphs...")
+    results_df = results.get_dataframe()
+    plot_bohb_graphs(results_df, prefix="resnet")
     print(f"Graphs successfully saved to {RESULTS_DIR}")

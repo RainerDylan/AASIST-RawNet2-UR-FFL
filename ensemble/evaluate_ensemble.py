@@ -14,6 +14,8 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from sklearn.metrics import roc_curve, auc, DetCurveDisplay, confusion_matrix, ConfusionMatrixDisplay
+from scipy.interpolate import interp1d
+from scipy.optimize import brentq
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..')) if 'ensemble' in CURRENT_DIR else CURRENT_DIR
@@ -28,9 +30,7 @@ from src.models.aasist import AASIST
 from src.models.resnet_simam import resnet18_simam
 
 BASE_DATASET_DIR = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset"
-RAW_CUSTOM_DIR = os.path.join(BASE_DATASET_DIR, "Custom_Raw_Audio")
 
-PREPROCESSED_CUSTOM_DIR = os.path.join(BASE_DATASET_DIR, "preprocessed_custom")
 PREPROCESSED_LA_DIR = os.path.join(BASE_DATASET_DIR, "preprocessed_la")
 PREPROCESSED_DF_DIR = os.path.join(BASE_DATASET_DIR, "preprocessed_df")
 
@@ -39,6 +39,8 @@ PROTOCOL_LA_EVAL = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset\2019\LA\ASVspoof20
 
 RAW_DF_EVAL_DIR = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset\2021\ASVspoof2021_DF_eval_part00\ASVspoof2021_DF_eval\flac"
 PROTOCOL_DF_EVAL = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset\2021\ASVspoof2021_DF_eval_part00\ASVspoof2021_DF_eval\trial_metadata.txt" 
+
+# ── ARCHITECTURE DEFINITIONS ──────────────────────────────────────────────────
 
 class MetaLearner(nn.Module):
     def __init__(self, input_dim=616, hidden_dim=256, num_classes=2, dropout=0.3):
@@ -59,8 +61,6 @@ class MetaLearner(nn.Module):
         x = self.dropout(x)
         return self.fc2(x)
 
-# ── ARCHITECTURE SYNC ─────────────────────────────────────────────────────────
-
 class BackboneWrapper(nn.Module):
     def __init__(self, backbone: nn.Module, fc_attr: str = "fc"):
         super().__init__()
@@ -70,7 +70,7 @@ class BackboneWrapper(nn.Module):
         self._handle = fc.register_forward_hook(self._capture)
 
     def _capture(self, module, inp, out):
-        self._emb = inp[0]
+        self._emb = inp[0] 
 
     def forward(self, x):
         self._emb = None
@@ -79,13 +79,52 @@ class BackboneWrapper(nn.Module):
         self._emb = None
         return logit, emb
 
-class CrossAttentionFuser(nn.Module):
+
+class CrossAttentionFuser_Baseline(nn.Module):
+    def __init__(self, dim_a=104, dim_r=512, embed_dim=256, num_heads=8, num_classes=2, dropout=0.30):
+        super().__init__()
+        self.proj_a = nn.Sequential(nn.Linear(dim_a, embed_dim), nn.LayerNorm(embed_dim))
+        self.proj_r = nn.Sequential(nn.Linear(dim_r, embed_dim), nn.LayerNorm(embed_dim))
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_emb = nn.Parameter(torch.zeros(1, 3, embed_dim))
+        
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        nn.init.trunc_normal_(self.pos_emb, std=0.02)
+
+        enc = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=num_heads,
+            dim_feedforward=embed_dim * 4, dropout=dropout,
+            batch_first=True, norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(enc, num_layers=2)
+        
+        self.head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim, num_classes),
+        )
+
+    def forward(self, ea, er):
+        ea = ea.float()
+        er = er.float()
+        B = ea.size(0)
+        seq = torch.cat([
+            self.cls_token.expand(B, -1, -1),
+            self.proj_a(ea).unsqueeze(1),
+            self.proj_r(er).unsqueeze(1),
+        ], dim=1) + self.pos_emb
+        return self.head(self.transformer(seq)[:, 0, :])
+
+# Baseline Fuser (No PosEmb, No Initial LayerNorm in Head)
+class CrossAttentionFuser_URFFL(nn.Module):
     def __init__(self, dim_a=104, dim_r=512, embed_dim=256, num_heads=8, num_classes=2, dropout=0.30):
         super().__init__()
         self.proj_a    = nn.Sequential(nn.Linear(dim_a, embed_dim), nn.LayerNorm(embed_dim))
         self.proj_r    = nn.Sequential(nn.Linear(dim_r, embed_dim), nn.LayerNorm(embed_dim))
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_emb   = nn.Parameter(torch.zeros(1, 3, embed_dim)) # SYNC: Added pos_emb
+        self.pos_emb   = nn.Parameter(torch.zeros(1, 3, embed_dim))
         
         enc = nn.TransformerEncoderLayer(
             d_model=embed_dim, nhead=num_heads,
@@ -94,7 +133,6 @@ class CrossAttentionFuser(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(enc, num_layers=2)
         
-        # SYNC: Added LayerNorm at index 0
         self.head = nn.Sequential(
             nn.LayerNorm(embed_dim),
             nn.Linear(embed_dim, embed_dim),
@@ -114,11 +152,10 @@ class CrossAttentionFuser(nn.Module):
         return self.head(self.transformer(seq)[:, 0, :])
 
 class EndToEndEnsemble(nn.Module):
-    def __init__(self, aasist, resnet, fuser, is_cross_attention=True):
+    def __init__(self, aasist, resnet, fuser, mode="baseline"):
         super().__init__()
-        self.is_cross_attention = is_cross_attention
-        if self.is_cross_attention:
-            # SYNC: Use BackboneWrapper for CrossAttention architecture
+        self.mode = mode
+        if self.mode == "urffl_crossattention":
             self.aasist_w = BackboneWrapper(aasist, fc_attr="fc")
             self.resnet_w = BackboneWrapper(resnet, fc_attr="fc")
         else:
@@ -134,7 +171,7 @@ class EndToEndEnsemble(nn.Module):
         self.fusion_head = fuser
 
     def forward(self, wav, mel):
-        if self.is_cross_attention:
+        if self.mode == "urffl_crossattention":
             _, ea = self.aasist_w(wav.float())
             _, er = self.resnet_w(mel.float())
             return self.fusion_head(ea, er)
@@ -144,15 +181,29 @@ class EndToEndEnsemble(nn.Module):
                 _ = self.resnet(mel)
                 return self.fusion_head(self.emb_a[0], self.emb_r[0])
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ── METRICS & DATA ────────────────────────────────────────────────────────────
 
-def compute_min_dcf(fpr, fnr, p_target=0.05, c_miss=1.0, c_fa=1.0):
+def compute_eer(y_true, y_scores):
+    try:
+        fpr, tpr, thresholds = roc_curve(y_true, y_scores, pos_label=1)
+        fnr = 1. - tpr
+        eer = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
+        thresh = interp1d(fpr, thresholds)(eer)
+    except Exception:
+        fpr, tpr, thresholds = roc_curve(y_true, y_scores, pos_label=1)
+        fnr = 1. - tpr
+        idx = np.nanargmin(np.abs(fnr - fpr))
+        eer = float((fpr[idx] + fnr[idx]) / 2.)
+        thresh = thresholds[idx]
+    return float(eer * 100.), thresh
+
+def compute_min_dcf(fpr, fnr, thresholds, p_target=0.05, c_miss=1.0, c_fa=1.0):
     dcf = c_miss * fnr * p_target + c_fa * fpr * (1.0 - p_target)
-    min_dcf = np.min(dcf)
     min_dcf_idx = np.argmin(dcf)
+    min_dcf = dcf[min_dcf_idx]
     default_dcf = min(c_miss * p_target, c_fa * (1.0 - p_target))
     min_dcf_norm = min_dcf / default_dcf
-    return min_dcf_norm, dcf, default_dcf, min_dcf_idx
+    return min_dcf_norm, thresholds[min_dcf_idx]
 
 def create_shuffled_protocol(original_protocol, target_protocol):
     bonafide_lines = []
@@ -254,44 +305,74 @@ def preprocess_evaluation(eval_dir, protocol_file, target_dir, target_total=7000
 def load_ensemble(device, selected_weights_path):
     print(f"\nLoading End-to-End Ensemble from {selected_weights_path}...")
     
+    # Base Models with MAIN branch dimensions
     aasist_model = AASIST(stft_window=698, stft_hop=398, freq_bins=116, gat_layers=2, heads=5, head_dim=104, hidden_dim=455, dropout=0.33).to(device)
     resnet_model = resnet18_simam(num_classes=2, dropout_rate=0.22).to(device)
     
-    is_cross_attention = "crossattention" in os.path.basename(selected_weights_path).lower()
+    filename = os.path.basename(selected_weights_path).lower()
     
-    if is_cross_attention:
-        print("-> Detected Cross-Attention Feature Fusion head.")
-        fusion_head = CrossAttentionFuser().to(device)
+    if "urffl" in filename and "crossattention" in filename:
+        print("-> Detected UR-FFL Cross-Attention Architecture.")
+        mode = "urffl_crossattention"
+        fusion_head = CrossAttentionFuser_URFFL().to(device)
+    elif "crossattention" in filename:
+        print("-> Detected Baseline Cross-Attention Architecture.")
+        mode = "baseline_crossattention"
+        fusion_head = CrossAttentionFuser_Baseline().to(device)
     else:
         print("-> Detected Standard MLP Meta-Learner head.")
+        mode = "meta"
         fusion_head = MetaLearner(input_dim=616).to(device)
     
-    wrapper = EndToEndEnsemble(aasist_model, resnet_model, fusion_head, is_cross_attention).to(device)
+    wrapper = EndToEndEnsemble(aasist_model, resnet_model, fusion_head, mode).to(device)
     
     checkpoint = torch.load(selected_weights_path, map_location=device)
-    
-    if 'model_state_dict' in checkpoint:
-        state_dict = checkpoint['model_state_dict']
-    else:
-        state_dict = checkpoint
+    state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
 
-    if not is_cross_attention:
-        new_state_dict = {}
-        for k, v in state_dict.items():
-            if 'meta_learner' in k:
-                new_key = k.replace('meta_learner', 'fusion_head')
-                new_state_dict[new_key] = v
-            else:
-                new_state_dict[k] = v
-        wrapper.load_state_dict(new_state_dict)
-    else:
-        wrapper.load_state_dict(state_dict)
+    # 1. Map legacy weight prefixes dynamically
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if 'meta_learner' in k:
+            k = k.replace('meta_learner', 'fusion_head')
+            
+        # Handle legacy weights without BackboneWrapper (aasist -> aasist_w.backbone)
+        if mode == "urffl_crossattention":
+            if k.startswith('aasist.'):
+                k = k.replace('aasist.', 'aasist_w.backbone.')
+            if k.startswith('resnet.'):
+                k = k.replace('resnet.', 'resnet_w.backbone.')
+                
+        new_state_dict[k] = v
+
+    # 2. Patch Fusion Head architecture mismatches for legacy weights
+    if mode in ["urffl_crossattention", "baseline_crossattention"]:
+        head_0_weight = new_state_dict.get('fusion_head.head.0.weight')
         
+        # If the checkpoint's head.0 is a 2D Linear layer instead of a 1D LayerNorm
+        if head_0_weight is not None and len(head_0_weight.shape) == 2:
+            print("-> [Legacy Checkpoint] Rebuilding Cross-Attention head to match old architecture.")
+            embed_dim = head_0_weight.shape[1] # Auto-detect legacy dimension (e.g., 256)
+            
+            # Rebuild the head without LayerNorm to match the old saved weights perfectly
+            wrapper.fusion_head.head = torch.nn.Sequential(
+                torch.nn.Linear(embed_dim, embed_dim),
+                torch.nn.ReLU(),
+                torch.nn.Dropout(0.30),
+                torch.nn.Linear(embed_dim, 2)
+            ).to(device)
+            
+        # If checkpoint is missing the newly added Positional Embeddings, inject dummy zeroes
+        if 'fusion_head.pos_emb' not in new_state_dict and hasattr(wrapper.fusion_head, 'pos_emb'):
+            print("-> [Legacy Checkpoint] Injecting missing positional embeddings.")
+            new_state_dict['fusion_head.pos_emb'] = wrapper.fusion_head.pos_emb.data
+
+    # Load the patched dictionary into the dynamically adjusted model
+    wrapper.load_state_dict(new_state_dict)
     wrapper.eval()
     
     mel_transform = T.MelSpectrogram(sample_rate=16000, n_fft=512, hop_length=160, n_mels=80).to(device)
     amp_to_db = T.AmplitudeToDB(stype='power', top_db=80).to(device)
-
+    
     return wrapper, mel_transform, amp_to_db
 
 def main():
@@ -397,12 +478,8 @@ def main():
     fnr = 1 - tpr
     auc_score = auc(fpr, tpr)
     
-    eer_idx = np.nanargmin(np.absolute((fnr - fpr)))
-    eer = fpr[eer_idx] * 100
-    eer_threshold = thresholds[eer_idx]
-    
-    min_dcf_norm, dcf_curve, default_dcf, min_dcf_idx = compute_min_dcf(fpr, fnr)
-    dcf_threshold = thresholds[min_dcf_idx]
+    eer, eer_threshold = compute_eer(all_labels, all_probs)
+    min_dcf_norm, dcf_threshold = compute_min_dcf(fpr, fnr, thresholds)
     
     cm = confusion_matrix(all_labels, all_preds)
     tn, fp, fn, tp = cm.ravel()
@@ -443,7 +520,6 @@ def main():
     
     # ── PLOTTING ─────────────────────────────────────────────────────────────────
     
-    # 1. ROC Curve
     plt.figure(figsize=(8, 6))
     plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {auc_score:.4f})')
     plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
@@ -454,20 +530,18 @@ def main():
     plt.title(f'ROC Curve ({dataset_name} Evaluation)')
     plt.legend(loc="lower right")
     plt.grid(True, linestyle=':', alpha=0.6)
-    roc_path = os.path.join(RESULTS_DIR, f"eval_roc_curve_{dataset_name.lower()}.png")
+    roc_path = os.path.join(RESULTS_DIR, f"crossattention_roc_curve_{dataset_name.lower()}.png")
     plt.savefig(roc_path, dpi=300, bbox_inches='tight')
     plt.close()
     
-    # 2. Confusion Matrix
     fig, ax = plt.subplots(figsize=(7, 6))
     cm_display = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['Deepfake', 'Bonafide'])
     cm_display.plot(cmap=plt.cm.Blues, ax=ax, values_format='d')
     plt.title(f'Confusion Matrix ({dataset_name})', fontsize=12, pad=15)
-    cm_path = os.path.join(RESULTS_DIR, f"eval_confusion_matrix_{dataset_name.lower()}.png")
+    cm_path = os.path.join(RESULTS_DIR, f"crossattention_confusion_matrix_{dataset_name.lower()}.png")
     plt.savefig(cm_path, dpi=300, bbox_inches='tight')
     plt.close()
     
-    # 3. Score Distribution Histogram (New)
     plt.figure(figsize=(10, 6))
     plt.hist(bonafide_scores, bins=50, alpha=0.6, color='blue', density=True, label='Bonafide (Genuine)')
     plt.hist(deepfake_scores, bins=50, alpha=0.6, color='red', density=True, label='Spoof (Deepfake)')
@@ -477,17 +551,47 @@ def main():
     plt.ylabel('Density')
     plt.legend(loc='upper center')
     plt.grid(True, linestyle=':', alpha=0.6)
-    dist_path = os.path.join(RESULTS_DIR, f"eval_score_distribution_{dataset_name.lower()}.png")
+    dist_path = os.path.join(RESULTS_DIR, f"crossattention_score_distribution_{dataset_name.lower()}.png")
     plt.savefig(dist_path, dpi=300, bbox_inches='tight')
     plt.close()
     
-    # 4. DET Curve (New)
     fig, ax = plt.subplots(figsize=(8, 8))
     DetCurveDisplay(fpr=fpr, fnr=fnr, estimator_name=f"Ensemble (EER={eer:.2f}%)").plot(ax=ax)
     plt.title(f'Detection Error Tradeoff (DET) Curve - {dataset_name}')
     plt.grid(True, linestyle=':', alpha=0.6)
-    det_path = os.path.join(RESULTS_DIR, f"eval_det_curve_{dataset_name.lower()}.png")
+    det_path = os.path.join(RESULTS_DIR, f"crossattention_det_curve_{dataset_name.lower()}.png")
     plt.savefig(det_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # Graph 5: Min DCF Curve
+    p_target = 0.05
+    c_miss = 1.0
+    c_fa = 1.0
+    
+    # Recalculate DCF curve points for plotting
+    dcf_values = c_miss * fnr * p_target + c_fa * fpr * (1.0 - p_target)
+    default_dcf = min(c_miss * p_target, c_fa * (1.0 - p_target))
+    norm_dcf_values = dcf_values / default_dcf
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(thresholds, norm_dcf_values, color='purple', lw=2, label='Normalized DCF')
+    plt.axvline(dcf_threshold, color='red', linestyle='--', label=f'Min DCF Threshold ({dcf_threshold:.4f})')
+    plt.plot(dcf_threshold, min_dcf_norm, 'ro')
+    
+    # Add text label slightly offset from the minimum point
+    plt.text(dcf_threshold + 0.02, min_dcf_norm + 0.02, f'Min t-DCF = {min_dcf_norm:.4f}', color='red', fontweight='bold')
+    
+    plt.xlim([0.0, 1.0])
+    # Dynamically scale Y-axis so the curve fits nicely without zooming out too far
+    plt.ylim([0.0, max(1.2, np.max(norm_dcf_values[(thresholds >= 0.0) & (thresholds <= 1.0)]) * 1.1)])
+    plt.xlabel('Detection Threshold')
+    plt.ylabel('Normalized DCF (Lower is Better)')
+    plt.title(f'Detection Cost Function (DCF) Curve - {dataset_name}')
+    plt.legend(loc="upper right")
+    plt.grid(True, linestyle=':', alpha=0.6)
+    
+    dcf_path = os.path.join(RESULTS_DIR, f"crossattention_dcf_curve_{dataset_name.lower()}.png")
+    plt.savefig(dcf_path, dpi=300, bbox_inches='tight')
     plt.close()
     
     print(f"Successfully generated and saved 4 Diagnostic Graphics to {RESULTS_DIR}")

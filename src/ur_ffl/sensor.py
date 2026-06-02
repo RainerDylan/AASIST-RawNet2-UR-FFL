@@ -1,41 +1,4 @@
-"""
-Uncertainty Sensor for the UR-FFL module.
 
-Returns predictive entropy H (nats) per sample and the batch mean.
-
-Why entropy instead of Ue = var/(mu*(1-mu))?
-─────────────────────────────────────────────
-The Ue formula has an inversion artefact: as mu → 0 or 1 (high
-confidence) the Bernoulli denominator mu(1−mu) → 0, which artificially
-INFLATES Ue for confident predictions.  A highly confident but wrong
-prediction gets a larger Ue than a genuinely confused prediction —
-inverting the intended uncertainty ranking and making the selector assign
-profiles in the wrong direction.
-
-Predictive entropy (Gal & Ghahramani 2016, Eq. 11):
-
-    H(μ) = −μ·ln(μ+ε) − (1−μ)·ln(1−μ+ε)
-
-Properties that make H the correct feedback signal:
-  • H ∈ [0, ln 2] nats  — bounded, independent of μ's scale
-  • H(μ) = H(1−μ)       — symmetric across classes
-  • Maximised at μ = 0.5 (maximum confusion)
-  • Monotone from each extreme toward 0.5
-
-mc_passes = 10
-──────────────
-Gal & Ghahramani (2016): uncertainty estimate variance ∝ 1/T.
-At T = 10, std(mean_H) ≈ 0.008 nats — sufficient for stable PD control.
-Smith & Gal (2018): T ≥ 10 is adequate for adversarial detection tasks.
-Using T = 10 instead of 20 halves the sensor overhead per batch.
-
-References
-──────────
-Gal & Ghahramani (2016): Dropout as Bayesian Approximation.  ICML.
-Smith & Gal (2018): Understanding Uncertainty for Adversarial Detection.  UAI.
-Kendall & Gal (2018): What Uncertainties Do We Need?  NeurIPS.
-Thesis Section 3.5.1.
-"""
 
 import torch
 
